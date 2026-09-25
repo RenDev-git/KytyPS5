@@ -10,6 +10,9 @@
 #include <windows.h>
 #undef min
 #undef max
+#elif defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 #endif
 
 namespace Libs::Graphics {
@@ -20,10 +23,13 @@ bool IsAccessible(DWORD protect, HostMemoryAccess access) {
 	constexpr DWORD blocked  = PAGE_NOACCESS | PAGE_GUARD;
 	constexpr DWORD readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
 	                           PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+	constexpr DWORD writable = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE |
+	                           PAGE_EXECUTE_WRITECOPY;
 	if (access == HostMemoryAccess::Mapped) {
 		return (protect & PAGE_GUARD) == 0;
 	}
-	return (protect & blocked) == 0 && (protect & readable) != 0;
+	return (protect & blocked) == 0 &&
+	       (protect & (access == HostMemoryAccess::Write ? writable : readable)) != 0;
 }
 #endif
 
@@ -56,6 +62,35 @@ bool HostMemoryQueryRange(uint64_t addr, uint64_t requested_size, HostMemoryAcce
 		}
 		current = finish < end ? finish : end;
 	}
+#elif defined(__APPLE__)
+	while (current < end) {
+		mach_vm_address_t          region_addr = static_cast<mach_vm_address_t>(current);
+		mach_vm_size_t             region_size = 0;
+		vm_region_basic_info_data_64_t info {};
+		mach_msg_type_number_t      count       = VM_REGION_BASIC_INFO_COUNT_64;
+		mach_port_t                 object_name = MACH_PORT_NULL;
+		const auto result = mach_vm_region(
+		    mach_task_self(), &region_addr, &region_size, VM_REGION_BASIC_INFO_64,
+		    reinterpret_cast<vm_region_info_t>(&info), &count, &object_name);
+		if (object_name != MACH_PORT_NULL) {
+			mach_port_deallocate(mach_task_self(), object_name);
+		}
+		if (result != KERN_SUCCESS || region_addr > current || region_size == 0) {
+			break;
+		}
+		const auto required_protection = access == HostMemoryAccess::Write ? VM_PROT_WRITE : VM_PROT_READ;
+		if (access != HostMemoryAccess::Mapped && (info.protection & required_protection) == 0) {
+			break;
+		}
+		const auto region_end = UINT64_MAX - region_addr < region_size
+		                           ? UINT64_MAX
+		                           : static_cast<uint64_t>(region_addr + region_size);
+		if (region_end <= current) {
+			break;
+		}
+		current = region_end < end ? region_end : end;
+	}
+	accessible_size = current - addr;
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	auto* maps = std::fopen("/proc/self/maps", "r");
 	if (maps == nullptr) {
@@ -73,7 +108,9 @@ bool HostMemoryQueryRange(uint64_t addr, uint64_t requested_size, HostMemoryAcce
 		if (begin > current) {
 			break;
 		}
-		const bool allowed = access == HostMemoryAccess::Mapped || permissions[0] == 'r';
+		const bool allowed = access == HostMemoryAccess::Mapped ||
+		                     (access == HostMemoryAccess::Write ? permissions[1] == 'w'
+		                                                       : permissions[0] == 'r');
 		if (!allowed) {
 			break;
 		}
@@ -102,6 +139,15 @@ bool HostMemoryRangeIsReadable(uint64_t addr, uint64_t size) {
 	}
 	uint64_t readable_size = 0;
 	return HostMemoryQueryReadable(addr, size, readable_size) && readable_size >= size;
+}
+
+bool HostMemoryRangeIsWritable(uint64_t addr, uint64_t size) {
+	if (addr == 0 || size == 0 || UINT64_MAX - addr < size) {
+		return false;
+	}
+	uint64_t writable_size = 0;
+	return HostMemoryQueryRange(addr, size, HostMemoryAccess::Write, writable_size) &&
+	       writable_size >= size;
 }
 
 } // namespace Libs::Graphics
