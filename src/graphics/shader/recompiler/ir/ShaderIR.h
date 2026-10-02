@@ -30,6 +30,7 @@ enum class ResourceKind {
 	Buffer,
 	IndirectBuffer,
 	Flat,
+	FlatLocal,
 	Global,
 	Scratch,
 	Lds,
@@ -40,7 +41,8 @@ enum class ResourceKind {
 
 [[nodiscard]] constexpr bool IsAddressResourceKind(ResourceKind kind) {
 	return kind == ResourceKind::ScalarAddress || kind == ResourceKind::Flat ||
-	       kind == ResourceKind::Global || kind == ResourceKind::Scratch;
+	       kind == ResourceKind::FlatLocal || kind == ResourceKind::Global ||
+	       kind == ResourceKind::Scratch;
 }
 
 struct MemoryInfo {
@@ -147,6 +149,7 @@ struct SamplerResource {
 	uint32_t first_use_pc          = 0;
 	bool     force_point_filtering = false;
 	bool     depth_compare         = false;
+	bool     integer_border        = false;
 
 	bool operator==(const SamplerResource& other) const = default;
 };
@@ -435,7 +438,7 @@ struct BindingLayout {
 };
 
 struct ShaderInfo {
-	static constexpr uint32_t MaxBuffers      = 32;
+	static constexpr uint32_t MaxBuffers      = 64;
 	static constexpr uint32_t MaxImages       = 64;
 	static constexpr uint32_t MaxSamplers     = 32;
 	static constexpr uint32_t MaxSampledPairs = 64;
@@ -473,6 +476,7 @@ struct DescriptorSource {
 		uint32_t table_offset    = 0;
 		Value    key_count;
 		Value    selector_mask;
+		std::vector<uint32_t> sources;
 
 		bool operator==(const IndirectImage& other) const = default;
 	};
@@ -496,6 +500,7 @@ struct ResourceBlock {
 	Value                 condition;
 	std::vector<uint32_t> successors;
 	std::vector<uint32_t> sources;
+	std::vector<uint32_t> srt_reads;
 };
 
 // Stable shader metadata consumed by the renderer after native IR has been discarded.
@@ -507,6 +512,7 @@ struct CompiledShaderInfo {
 	uint32_t                      user_data_count     = 64;
 	uint32_t                      scratch_dwords      = 0;
 	uint32_t                      param_export_mask   = 0;
+	bool                          has_address_writes  = false;
 	ShaderInfo                    info;
 	BindingLayout                 bindings;
 };
@@ -548,7 +554,7 @@ struct ResourcePlan {
 	std::vector<SrtRead>                srt_reads;
 	std::vector<uint8_t>                clean_flat_slots;
 	bool                                requires_specialization_memory = false;
-	bool                                has_address_writes = false;
+	bool                                capture_specialization_reads = false;
 	bool                                srt_plan_complete          = false;
 	bool                                resource_tracking_complete = false;
 	ShaderInfo                          info;
@@ -561,7 +567,6 @@ struct ResourcePlan {
 	mutable std::vector<uint8_t>            visited_blocks;
 	mutable std::vector<uint32_t>           pending_blocks;
 	mutable std::vector<uint32_t>           material_keys;
-	mutable std::vector<std::pair<uint64_t, uint64_t>> specialization_reads;
 };
 
 struct Program: ResourcePlan {
@@ -582,10 +587,12 @@ struct Program: ResourcePlan {
 	CFG::FailureKind              cfg_failure_kind    = CFG::FailureKind::None;
 	std::string                   fallback_reason;
 	std::vector<BlockInfo>        block_info;
+	struct ScalarWrite { uint32_t pc; ScalarReg reg; };
+	std::vector<ScalarWrite>      scalar_writes;
 	// Typed memory and export instructions reference shader-local metadata by dense index.
 	// Decoder-only details (such as NSA register numbers) have already become IR operands.
 	std::vector<ExportInfo>       export_info;
-	std::vector<Value>            dynamic_reads;
+	bool                          has_address_writes = false;
 	bool                          shader_info_complete = false;
 	BindingLayout                 bindings;
 	bool                          binding_layout_complete = false;
